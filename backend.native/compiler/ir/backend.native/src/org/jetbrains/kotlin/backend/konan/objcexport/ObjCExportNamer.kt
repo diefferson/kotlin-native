@@ -46,9 +46,6 @@ internal class ObjCExportNamerImpl(
         private val topLevelNamePrefix: String = moduleDescriptor.namePrefix
 ) : ObjCExportNamer {
 
-    private fun String.mangleClassOrProtocolName(): ObjCExportNamer.ClassOrProtocolName =
-            ObjCExportNamer.ClassOrProtocolName(swiftName = this, objCName = "$topLevelNamePrefix${this}")
-
     private fun String.toUnmangledClassOrProtocolName(): ObjCExportNamer.ClassOrProtocolName =
             ObjCExportNamer.ClassOrProtocolName(swiftName = this, objCName = this)
 
@@ -95,13 +92,15 @@ internal class ObjCExportNamerImpl(
                 !mapper.canHaveSameName(first, second)
     }
 
-    private val classNames = object : Mapping<Any, String>() {
-        override fun conflict(first: Any, second: Any): Boolean = true
+    private inner open class GlobalNameMapping<in T : Any, N> : Mapping<T, N>() {
+        final override fun conflict(first: T, second: T): Boolean = true
     }
 
-    private val protocolNames = object : Mapping<Any, String>() {
-        override fun conflict(first: Any, second: Any): Boolean = true
-    }
+    private val objCClassNames = GlobalNameMapping<Any, String>()
+    private val objCProtocolNames = GlobalNameMapping<ClassDescriptor, String>()
+
+    // Classes and protocols share the same namespace in Swift.
+    private val swiftClassAndProtocolNames = GlobalNameMapping<Any, String>()
 
     private abstract inner class ClassPropertyNameMapping<T : Any> : Mapping<T, String>() {
 
@@ -127,12 +126,26 @@ internal class ObjCExportNamerImpl(
                 first.containingDeclaration == second.containingDeclaration
     }
 
-    override fun getFileClassName(file: SourceFile): ObjCExportNamer.ClassOrProtocolName = classNames.getOrPut(file) {
-        val psiSourceFile = file as? PsiSourceFile ?: error("SourceFile '$file' is not PsiSourceFile")
-        val psiFile = psiSourceFile.psiFile
-        val ktFile = psiFile as? KtFile ?: error("PsiFile '$psiFile' is not KtFile")
-        StringBuilder(PackagePartClassUtils.getFilePartShortName(ktFile.name)).mangledSequence { append("_") }
-    }.mangleClassOrProtocolName()
+    override fun getFileClassName(file: SourceFile): ObjCExportNamer.ClassOrProtocolName {
+        val baseName by lazy {
+            val psiSourceFile = file as? PsiSourceFile ?: error("SourceFile '$file' is not PsiSourceFile")
+            val psiFile = psiSourceFile.psiFile
+            val ktFile = psiFile as? KtFile ?: error("PsiFile '$psiFile' is not KtFile")
+            PackagePartClassUtils.getFilePartShortName(ktFile.name)
+        }
+
+        val objCName = objCClassNames.getOrPut(file) {
+            StringBuilder(topLevelNamePrefix).append(baseName)
+                    .mangledBySuffixUnderscores()
+        }
+
+        val swiftName = swiftClassAndProtocolNames.getOrPut(file) {
+            StringBuilder(baseName)
+                    .mangledBySuffixUnderscores()
+        }
+
+        return ObjCExportNamer.ClassOrProtocolName(swiftName = swiftName, objCName = objCName)
+    }
 
     private val predefinedClassNames = mapOf(
             builtIns.any to kotlinAnyName,
@@ -143,19 +156,43 @@ internal class ObjCExportNamerImpl(
     override fun getClassOrProtocolName(descriptor: ClassDescriptor): ObjCExportNamer.ClassOrProtocolName {
         predefinedClassNames[descriptor]?.let { return it }
 
-        val mapping = if (descriptor.isInterface) protocolNames else classNames
+        val objCMapping = if (descriptor.isInterface) objCProtocolNames else objCClassNames
+        val containingDeclaration = descriptor.containingDeclaration
 
-        return mapping.getOrPut(descriptor) {
-            StringBuilder().apply {
+        return if (containingDeclaration is ClassDescriptor) {
+            val objCName = objCMapping.getOrPut(descriptor) {
+                StringBuilder(getClassOrProtocolName(containingDeclaration).objCName)
+                        .append(descriptor.name.asString().capitalize())
+                        .mangledBySuffixUnderscores()
+            }
+
+            val swiftName = swiftClassAndProtocolNames.getOrPut(descriptor) {
+                StringBuilder(getClassOrProtocolName(containingDeclaration).swiftName)
+                        .append(".").append(descriptor.name.asString())
+                        .mangledBySuffixUnderscores()
+            }
+
+            ObjCExportNamer.ClassOrProtocolName(swiftName = swiftName, objCName = objCName)
+        } else {
+            fun StringBuilder.appendBaseName(): StringBuilder = apply {
                 if (descriptor.module != moduleDescriptor) {
                     append(descriptor.module.namePrefix)
                 }
+                append(descriptor.name.asString())
+            }
 
-                descriptor.parentsWithSelf.takeWhile { it is ClassDescriptor }
-                        .toList().reversed()
-                        .joinTo(this, "") { it.name.asString().capitalize() }
-            }.mangledSequence { append("_") }
-        }.mangleClassOrProtocolName()
+            val objCName = objCMapping.getOrPut(descriptor) {
+                StringBuilder().append(topLevelNamePrefix).appendBaseName()
+                        .mangledBySuffixUnderscores()
+            }
+
+            val swiftName = swiftClassAndProtocolNames.getOrPut(descriptor) {
+                StringBuilder().appendBaseName()
+                        .mangledBySuffixUnderscores()
+            }
+
+            ObjCExportNamer.ClassOrProtocolName(swiftName = swiftName, objCName = objCName)
+        }
     }
 
     override fun getSelector(method: FunctionDescriptor): String = methodSelectors.getOrPut(method) {
@@ -258,7 +295,7 @@ internal class ObjCExportNamerImpl(
         return objectInstanceSelectors.getOrPut(descriptor) {
             val name = descriptor.name.asString().decapitalize().mangleIfSpecialFamily("get")
 
-            StringBuilder(name).mangledSequence { append("_") }
+            StringBuilder(name).mangledBySuffixUnderscores()
         }
     }
 
@@ -272,7 +309,7 @@ internal class ObjCExportNamerImpl(
                 if (index == 0) lower else lower.capitalize()
             }.joinToString("").mangleIfSpecialFamily("the")
 
-            StringBuilder(name).mangledSequence { append("_") }
+            StringBuilder(name).mangledBySuffixUnderscores()
         }
     }
 
@@ -280,8 +317,8 @@ internal class ObjCExportNamerImpl(
         val any = builtIns.any
 
         predefinedClassNames.forEach { descriptor, name ->
-            // Note: it is a hack.
-            classNames.forceAssign(descriptor, name.swiftName)
+            objCClassNames.forceAssign(descriptor, name.objCName)
+            swiftClassAndProtocolNames.forceAssign(descriptor, name.swiftName)
         }
 
         fun ClassDescriptor.method(name: String) =
@@ -336,7 +373,7 @@ internal class ObjCExportNamerImpl(
     private fun String.startsWithWords(words: String) = this.startsWith(words) &&
             (this.length == words.length || !this[words.length].isLowerCase())
 
-    private abstract inner class Mapping<T : Any, N>() {
+    private abstract inner class Mapping<in T : Any, N>() {
         private val elementToName = mutableMapOf<T, N>()
         private val nameToElements = mutableMapOf<N, MutableList<T>>()
 
@@ -389,6 +426,8 @@ private inline fun StringBuilder.mangledSequence(crossinline mangle: StringBuild
             this@mangledSequence.mangle()
             this@mangledSequence.toString()
         }
+
+private fun StringBuilder.mangledBySuffixUnderscores() = this.mangledSequence { append("_") }
 
 private fun ObjCExportMapper.canHaveCommonSubtype(first: ClassDescriptor, second: ClassDescriptor): Boolean {
     if (first.isSubclassOf(second) || second.isSubclassOf(first)) {
